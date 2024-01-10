@@ -1,0 +1,115 @@
+---
+title: "A gentle introduction to `scoringutils`"
+author: "Joel Hellewell"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(scoringutils)
+library(rstanarm)
+library(data.table)
+```
+
+We will start by generating some fake time series data. We generate values of an output variable, $y$, at 30 time points, where $y_i = 1.02 * y_{i-1} + \epsilon$ with $\epsilon \sim normal(0, 1)$ and $y_1 = 1$. 
+
+```{r gen_data}
+set.seed(32542)
+y <- 1
+for(i in 2:30){
+  y[i] <- 1.02 * y[i - 1] + rnorm(1, 0, 1)
+}
+
+fake_data <- data.frame(time = 1:30, observed = y)
+plot(fake_data, ylab = "y")
+```
+
+We will take the first 25 timepoints as our training data and make a forecast for the next 5 timepoints. We will score this forecast against the final 5 timepoints in our fake data. We will fit a simple linear model using the `lm` function. A simple linear regression model assumes that $y = \beta*time + \epsilon$ with $\epsilon \sim normal(0, 1)$. We already know that this is the function form of the process we used to generate our fake data, so hopefully it will produce an accurate forecast.
+
+We then plot our model fit (red line) against the training data (black points). We can then use our fitted linear model to generate point forecasts for the next 5 timepoints (red points) and plot those forecasts next to the test data (blue points).
+
+```{r}
+# Split dataset
+training_data <- subset(fake_data, time < 26)
+test_data <- subset(fake_data, time > 25)
+
+# Fit linear model to training data
+mod <- lm(data = training_data, observed ~ time)
+fit <- predict(mod, newdata = data.frame(time = seq(0, 25, 0.1)))
+
+# Generate forecasts for the next 5 timesteps
+pred <- predict(mod, newdata = data.frame(time = 26:30))
+predictions <- data.frame(time = 26:30, y = pred)
+
+# Plot fake data and forecasts
+plot(training_data, xlim = c(0, 30), ylim = c(0, 15),
+     xlab = "timepoint", ylab = "Output Variable")
+lines(data.frame(time = seq(0, 25, 0.1), fit), col = "red")
+points(predictions, col = "red")
+points(test_data, col = "blue")
+```
+
+To score our point forecasts from the linear model we re-format the data into a data.frame with the correctly named columns for point forecasts and then pass this data.frame to the `score` function.
+
+```{r}
+# Re-format forecasts and ground truth data into correct format
+forecast_data <- data.frame(time = test_data$time,
+                            observed = test_data$observed,
+                            predicted = predictions$y, 
+                            model = "linear_model")
+
+# Convert to scoringutils forecast
+forecast_data <- as_forecast(forecast_data)
+
+# Set forecast unit
+set_forecast_unit(forecast_data, forecast_unit = "time")
+
+# Score forecast
+mod_score <- score(forecast_data)
+
+# Summarise forecast scores over all timepoints
+summarise_scores(mod_score, across = "time")
+```
+
+We can also score probabilistic forecasts from a Bayesian linear model. The output from your Bayesian model is 4000 samples from the posterior predictive distribution for each time point, we will need to format the posterior samples using the `sample` format of forecast in `scoringutils`.
+
+```{r, results = "hide", warning=FALSE, message=FALSE}
+
+# Fit bayesian model using rstanarm
+mod2 <- stan_glm(observed ~ time, data = training_data, prior = NULL, family = "gaussian")
+bayesian_predictions <- as.data.table(posterior_predict(mod2, newdata = data.frame(time = test_data$time)))
+```
+
+
+```{r}
+n_samples <- nrow(bayesian_predictions)
+n_timepoints <- ncol(bayesian_predictions)
+bayesian_predictions$sample_id <- 1:n_samples
+
+# Change posterior samples from wide to long format
+dt <- melt(bayesian_predictions,
+     id.vars = "sample_id",
+     value.name = "predicted")
+
+# data.table::melt gives the variable column the values 1 to 5, 
+# whereas our timepoints are 26:30
+new_df <- data.frame(time = 26:30)
+timepoint_name <- colnames(new_df)
+dt[, variable := new_df[dt$variable , timepoint_name]]
+colnames(dt)[colnames(dt) == "variable"] <- timepoint_name
+
+# Merge ground truth data and posterior samples together
+dt <- merge.data.table(dt, test_data, by = "time")
+dt$model <- "Bayesian linear model"
+
+print(dt)
+```
+
+Because this is a probabilistic forecast, rather than the previous point forecast, the scoring metrics will be different.
+
+```{r} 
+
+score_bayesian <- score(dt)
+summarise_scores(score_bayesian, across = "time")
+```
